@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from . import classify as clf
-from . import history, notify, pricecheck
+from . import history, movers, notify, pricecheck
 from .fetch import Item, enrich, fetch_all
 from .sources import BROAD_KEYWORDS
 from .state import State
@@ -57,9 +57,8 @@ def run(dry_run: bool = False) -> int:
     if not topic or not api_key:
         log.error("NTFY_TOPIC and ANTHROPIC_API_KEY must be set")
         return 2
-    min_importance = int(os.environ.get("MIN_IMPORTANCE", "3"))
+    min_importance = int(os.environ.get("MIN_IMPORTANCE") or 5)
     max_age = timedelta(hours=float(os.environ.get("MAX_AGE_HOURS", "6")))
-    max_notifs = int(os.environ.get("MAX_NOTIFICATIONS_PER_RUN", "10"))
     model = os.environ.get("CLASSIFIER_MODEL", clf.MODEL)
     server = os.environ.get("NTFY_SERVER") or "https://ntfy.sh"  # `or`: Actions exports unset secrets as ""
     token = os.environ.get("NTFY_TOKEN") or None
@@ -84,12 +83,19 @@ def run(dry_run: bool = False) -> int:
     for it in candidates:
         enrich(it)
 
+    _client = []
+
+    def get_client():
+        if not _client:
+            import anthropic
+
+            _client.append(anthropic.Anthropic(api_key=api_key))
+        return _client[0]
+
     alerts: list[tuple[Item, clf.Verdict]] = []
     fatal: str | None = None
     if candidates:
-        import anthropic
-
-        client = anthropic.Anthropic(api_key=api_key)
+        client = get_client()
         results, fatal = clf.classify(client, candidates, model)
         if not fatal:
             state.meta.pop("fatal_alert", None)  # healthy again: the next outage should alert immediately
@@ -103,17 +109,13 @@ def run(dry_run: bool = False) -> int:
                 state.mark(it.uid, it.title)
 
     alerts.sort(key=lambda a: -a[1].importance)
-    sendable = alerts[:max_notifs]
-    for it, _ in alerts[max_notifs:]:
-        log.warning("over cap: dropping alert %r", it.title[:80])
-        state.mark(it.uid, it.title)
 
-    # One price download covers every alert this run; failures just mean no market-context line.
-    syms = {s for _, v in sendable for s in pricecheck.symbols_for(v.event_type, v.ticker).values()}
+    # One price download per run: it feeds the per-alert context AND the market-mover check below.
+    syms = set(movers.THRESHOLDS) | {s for _, v in alerts for s in pricecheck.symbols_for(v.event_type, v.ticker).values()}
     book = pricecheck.fetch_bars(syms)
     hist_data = history.load()
 
-    for it, v in sendable:
+    for it, v in alerts:
         message = notify.build_message(
             it,
             history.describe(v.event_type, v.ticker or None, hist_data),
@@ -127,6 +129,21 @@ def run(dry_run: bool = False) -> int:
             state.mark(it.uid, it.title)
         except Exception as e:
             log.error("ntfy send failed (will retry next run): %s", e)
+
+    # Price-triggered alert: the market made a big, fast move. Catches news the classifier under-rates.
+    move = movers.detect(book, datetime.now(timezone.utc))
+    if move and not movers.in_cooldown(move, state.meta.get("mover_end")):
+        log.info("market mover: %s %+.2f%%", move.symbol, move.pct * 100)
+        cause, confidence = movers.find_cause(get_client(), model, move, movers.candidates_for(items, move))
+        if dry_run:
+            title, message = notify.build_mover(move, cause, confidence)
+            print(f"\n[MOVER] {title}\n{message}")
+        else:
+            try:
+                notify.send_mover(move, cause, confidence, topic, server, token)
+                state.meta["mover_end"] = move.end.timestamp()
+            except Exception as e:
+                log.error("mover push failed (will retry next run): %s", e)
 
     exit_code = 0
     if fatal:

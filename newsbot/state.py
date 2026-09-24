@@ -34,7 +34,7 @@ class State:
         self.path = path
         self.fresh = not os.path.exists(path)  # first run (or lost cache): seed silently
         self.seen: dict[str, float] = {}
-        self.meta: dict[str, float] = {}
+        self.meta: dict = {}
         self.titles: list[tuple[float, frozenset[str]]] = []
         # Titles of items queued this run but not yet finished (classifier may still fail).
         # Never persisted: if we saved them, a retried item would match itself and be dropped.

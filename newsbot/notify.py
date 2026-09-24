@@ -35,11 +35,15 @@ def build_message(item: Item, history_text: str | None, context_text: str | None
     return "\n\n".join(p for p in parts if p) + f"\n— {item.source.name}"
 
 
+def _post(topic: str, server: str, token: str | None, **body) -> None:
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    r = requests.post(server.rstrip("/") + "/", json={"topic": topic, **body}, headers=headers, timeout=15)
+    r.raise_for_status()
+
+
 def send(item: Item, v: Verdict, message: str, topic: str, server: str = "https://ntfy.sh",
          token: str | None = None) -> None:
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
     body = {
-        "topic": topic,
         "title": (v.headline or item.title)[:250],
         "message": message,
         "priority": PRIORITY.get(v.importance, 3),
@@ -47,14 +51,37 @@ def send(item: Item, v: Verdict, message: str, topic: str, server: str = "https:
     }
     if item.url:
         body["click"] = item.url
-    r = requests.post(server.rstrip("/") + "/", json=body, headers=headers, timeout=15)
-    r.raise_for_status()
+    _post(topic, server, token, **body)
 
 
 def send_status(title: str, message: str, topic: str, server: str = "https://ntfy.sh",
                 token: str | None = None) -> None:
     """A bot-health message (not news). High priority so it isn't missed."""
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-    body = {"topic": topic, "title": title, "message": message, "priority": 4, "tags": ["warning"]}
-    r = requests.post(server.rstrip("/") + "/", json=body, headers=headers, timeout=15)
-    r.raise_for_status()
+    _post(topic, server, token, title=title, message=message, priority=4, tags=["warning"])
+
+
+def build_mover(move, cause, confidence: str) -> tuple[str, str]:
+    """(title, message) for a price-triggered alert. The move is fact; the cause is a labelled inference."""
+    from .movers import NAMES, NY
+
+    mins = round((move.end - move.start).total_seconds() / 60)
+    title = f"{'📈' if move.pct > 0 else '📉'} {NAMES.get(move.symbol, move.symbol)} {move.pct:+.1%} in {mins} min"
+    when = f"{move.start.astimezone(NY):%H:%M}–{move.end.astimezone(NY):%H:%M} ET"
+    lines = [f"{NAMES.get(move.symbol, move.symbol)} {move.pct:+.2%}, {when}."]
+    lines += [f"{NAMES.get(sym, sym)} {pct:+.2%} over the same window." for sym, pct in move.others.items()]
+    if cause:
+        lines += ["", f"Possible cause (matched by timing, unconfirmed, {confidence} confidence):",
+                  f"{cause.title}", f"— {cause.source.name}, {cause.published.astimezone(NY):%H:%M} ET"]
+    else:
+        lines += ["", "No headline in our sources clearly explains it."]
+    return title, "\n".join(lines)
+
+
+def send_mover(move, cause, confidence: str, topic: str, server: str = "https://ntfy.sh",
+               token: str | None = None) -> None:
+    title, message = build_mover(move, cause, confidence)
+    body = {"title": title, "message": message, "priority": 5,
+            "tags": ["chart_with_upwards_trend" if move.pct > 0 else "chart_with_downwards_trend"]}
+    if cause and cause.url:
+        body["click"] = cause.url
+    _post(topic, server, token, **body)

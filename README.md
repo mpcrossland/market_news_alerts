@@ -1,13 +1,40 @@
 # market-news-bot
 
-Polls free news sources every few minutes, drops duplicates, has Claude Haiku decide whether each
-new item is market-moving, and pushes a 1-2 sentence alert (what happened / what it hits / typical
-direction) to your phone via [ntfy](https://ntfy.sh).
+Polls free news sources every few minutes, drops duplicates, has Claude Haiku decide whether each new
+item is market-moving, and pushes an alert to your phone via [ntfy](https://ntfy.sh). **The bot never
+predicts.** Each alert is a short headline plus facts:
 
 ```
-feeds ──> dedupe (exact ID + fuzzy headline) ──> Haiku (importance 1-5, summary) ──> ntfy
-                                                       └─ importance < MIN_IMPORTANCE: dropped
+📱 Fed raises rates by a quarter point
+Hour before the news: → S&P 500 futures +0.02%, ↓ 10-yr yield -1bp        <- what markets were doing
+Since the news: ↑ S&P 500 futures +0.30%                                  <- how much has already moved
+
+Past Fed rate hikes since 2015 (20):                                      <- what past events like it did
+≈ S&P 500: up 6 of 20 days, median -0.26% (no consistent direction)
+— Fed
 ```
+
+Anything without history says "No historical data for this type of news." instead of guessing.
+
+```
+feeds -> dedupe -> Haiku (importance, headline, event type) -> history lookup + live price check -> ntfy
+```
+
+## Where the numbers come from
+
+- **Historical reactions** (`newsbot/data/reactions.json`, built by `scripts/build_history.py` from Yahoo
+  prices, FRED, the Fed and BLS date lists): Fed cut/hold/hike days, US CPI and jobs-report days, and
+  earnings beats/misses for ~100 large caps (EPS vs analyst estimate), all since 2015. A direction (↑/↓) is only
+  stated when it's statistically distinguishable from a coin flip (p < 0.01, at least 8 cases); otherwise
+  it says "no consistent direction". Rebuild monthly: `.venv/bin/python scripts/build_history.py`.
+- **Live price check** (`newsbot/pricecheck.py`): 5-minute Yahoo bars for S&P/Nasdaq futures (plus the 10-yr
+  yield for macro news and the company's stock when known). Prices are unofficial Yahoo data, so this
+  can fail (e.g. Yahoo throttling GitHub's servers); the alert then goes out without that line.
+
+Known limits: CPI and jobs are reported unconditionally, because markets react to the surprise vs
+expectations and there is no free source for expectations. The earnings universe is today's large caps
+(survivorship bias) and "beat" means EPS only, not guidance. Not yet covered: M&A, Trump posts, oil/
+geopolitics, Bank of Canada / StatCan.
 
 ## Sources
 
@@ -58,7 +85,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
   (until it is older than `MAX_AGE_HOURS`).
 - **Caps.** At most `MAX_NOTIFICATIONS_PER_RUN` alerts per run, highest importance first.
 - **Priority.** ntfy priority follows importance (5 = urgent, 4 = high, 3 = default).
-- **Cost.** Items are classified in batches of 15; importance 1-2 items return an empty summary to
+- **Cost.** Items are classified in batches of 15; importance 1-2 items return an empty headline to
   save output tokens. Expect on the order of a dollar or two a day on Haiku; check your usage after
   the first day and tune `MIN_IMPORTANCE` / the queries in `sources.py` if it's higher.
 - News text is treated as untrusted: the classifier only returns structured fields through a forced tool call.

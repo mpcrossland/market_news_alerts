@@ -112,8 +112,8 @@ class FakeClient:
         return SimpleNamespace(content=[SimpleNamespace(type="tool_use", input={"items": self.rows})])
 
 
-def row(i, imp, summary="Something happened.", cat="rates", direction="up"):
-    return {"id": i, "importance": imp, "category": cat, "direction": direction, "summary": summary}
+def row(i, imp, headline="Something happened", cat="rates", event_type="none", ticker=""):
+    return {"id": i, "importance": imp, "category": cat, "headline": headline, "event_type": event_type, "ticker": ticker}
 
 
 def test_classify_batch_parses_clamps_and_skips_bad_rows():
@@ -127,8 +127,8 @@ def test_classify_batch_parses_clamps_and_skips_bad_rows():
 
 
 def test_classify_returns_none_for_failed_batches():
-    res = clf.classify(FakeClient(exc=RuntimeError("529 overloaded")), [item("a", "one")])
-    assert res[0][1] is None
+    res, fatal = clf.classify(FakeClient(exc=RuntimeError("529 overloaded")), [item("a", "one")])
+    assert res[0][1] is None and fatal is None   # transient: retry quietly next run
 
 
 def test_classify_batches_large_inputs():
@@ -148,12 +148,19 @@ def test_ntfy_payload(monkeypatch):
         return SimpleNamespace(raise_for_status=lambda: None)
 
     monkeypatch.setattr(notify.requests, "post", fake_post)
-    v = clf.Verdict(5, "rates", "down", "Fed hikes 25bp; typically pressures equities and lifts USD.")
-    notify.send(item("a", "Fed raises rates — “unexpected”"), v, "my-topic", "https://ntfy.example/", "tk_1")
+    v = clf.Verdict(5, "rates", "Fed raises rates by a quarter point", "fomc_hike", "")
+    msg = notify.build_message(item("a", "raw headline"), "Past Fed rate hikes: ...", "Hour before the news: → S&P 500 futures +0.01%")
+    notify.send(item("a", "raw headline"), v, msg, "my-topic", "https://ntfy.example/", "tk_1")
     assert sent["url"] == "https://ntfy.example/"
     assert sent["json"]["topic"] == "my-topic" and sent["json"]["priority"] == 5
-    assert sent["json"]["message"].startswith("Fed hikes") and sent["json"]["click"] == "https://x/a"
-    assert sent["json"]["title"].startswith("📉 Fed:") and sent["headers"] == {"Authorization": "Bearer tk_1"}
+    assert sent["json"]["title"] == "Fed raises rates by a quarter point" and sent["json"]["click"] == "https://x/a"
+    assert sent["json"]["message"] == ("Hour before the news: → S&P 500 futures +0.01%\n\nPast Fed rate hikes: ...\n— Fed")
+    assert sent["headers"] == {"Authorization": "Bearer tk_1"}
+
+
+def test_message_says_so_when_there_is_no_history_and_never_guesses():
+    msg = notify.build_message(item("a", "x"), None, None)
+    assert msg == "No historical data for this type of news.\n— Fed"
 
 
 # ---- full run ---------------------------------------------------------------------
@@ -174,6 +181,7 @@ def wire(monkeypatch, items, client):
     monkeypatch.setattr("anthropic.Anthropic", lambda api_key: client)
     sent = []
     monkeypatch.setattr(main.notify, "send", lambda it, v, *a: sent.append((it.uid, v.importance)))
+    monkeypatch.setattr(main.pricecheck, "fetch_bars", lambda syms: {})
     return sent
 
 
@@ -238,3 +246,67 @@ def test_missing_config_exits_nonzero(monkeypatch, tmp_path):
     monkeypatch.delenv("NTFY_TOPIC", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     assert main.run() == 2
+
+
+# ---- API refusals (billing / key) fail loudly, once ------------------------------------------
+
+class ApiErr(Exception):
+    def __init__(self, status, msg):
+        super().__init__(msg)
+        self.status_code = status
+
+
+CREDIT = ApiErr(400, "Your credit balance is too low to access the Anthropic API.")
+
+
+def test_fatal_reason_only_for_errors_a_human_must_fix():
+    assert "credit balance" in clf.fatal_reason(CREDIT)
+    assert "key" in clf.fatal_reason(ApiErr(401, "invalid x-api-key"))
+    assert clf.fatal_reason(ApiErr(403, "forbidden")) and clf.fatal_reason(ApiErr(404, "model not found"))
+    assert clf.fatal_reason(ApiErr(429, "rate limited")) is None
+    assert clf.fatal_reason(ApiErr(529, "overloaded")) is None
+    assert clf.fatal_reason(ConnectionError("network down")) is None
+
+
+def test_classify_stops_calling_a_refusing_api_after_the_first_failure():
+    items = [item(str(i), f"headline {i}") for i in range(clf.BATCH_SIZE * 2 + 1)]
+    client = FakeClient(exc=CREDIT)
+    res, fatal = clf.classify(client, items)
+    assert len(client.calls) == 1 and "credit balance" in fatal
+    assert len(res) == len(items) and all(v is None for _, v in res)
+
+
+def seeded(env, monkeypatch, client):
+    wire(monkeypatch, [item("old", "Old story about interest rates today")], FakeClient([]))
+    main.run()
+    status = []
+    monkeypatch.setattr(main.notify, "send_status", lambda title, msg, *a: status.append((title, msg)))
+    return status
+
+
+def test_api_refusal_pushes_once_exits_red_then_stays_quiet_and_recovers(env, monkeypatch):
+    story = [item("s", "Central bank surprises markets with emergency rate hike")]
+    status = seeded(env, monkeypatch, None)
+
+    wire(monkeypatch, story, FakeClient(exc=CREDIT))
+    monkeypatch.setattr(main.notify, "send_status", lambda title, msg, *a: status.append((title, msg)))
+    assert main.run() == main.EXIT_API_REFUSED           # first failure: red run + push
+    assert len(status) == 1 and "credit balance" in status[0][1]
+
+    assert main.run() == 0 and len(status) == 1          # still broken inside 6h: quiet, no second push
+
+    sent = wire(monkeypatch, story, FakeClient([row(0, 4)]))   # fixed: item was retried, not lost
+    monkeypatch.setattr(main.notify, "send_status", lambda title, msg, *a: status.append((title, msg)))
+    assert main.run() == 0 and sent == [("s", 4)]
+
+    wire(monkeypatch, [item("s2", "Another central bank shock rattles bond markets")], FakeClient(exc=CREDIT))
+    monkeypatch.setattr(main.notify, "send_status", lambda title, msg, *a: status.append((title, msg)))
+    assert main.run() == main.EXIT_API_REFUSED and len(status) == 2   # broke again: alerts immediately
+
+
+def test_transient_api_trouble_does_not_page_you(env, monkeypatch):
+    status = seeded(env, monkeypatch, None)
+    wire(monkeypatch, [item("s", "Central bank surprises markets with emergency rate hike")],
+         FakeClient(exc=ApiErr(529, "overloaded")))
+    monkeypatch.setattr(main.notify, "send_status", lambda title, msg, *a: status.append((title, msg)))
+    assert main.run() == 0 and status == []

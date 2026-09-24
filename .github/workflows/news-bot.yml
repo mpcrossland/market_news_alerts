@@ -30,7 +30,7 @@ jobs:
       - run: pip install -r requirements.txt
 
       - name: Restore state
-        run: ./scripts/restore_state.sh
+        run: bash scripts/restore_state.sh
 
       - name: Check news
         env:
@@ -40,4 +40,4 @@ jobs:
 
       # Skipped if the run failed, so a bad run can't clobber good state.
       - name: Save state
-        run: ./scripts/save_state.sh
+        run: bash scripts/save_state.sh

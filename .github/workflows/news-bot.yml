@@ -38,6 +38,8 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: python -m newsbot.main
 
-      # Skipped if the run failed, so a bad run can't clobber good state.
+      # Runs even when the check step fails: the bot saves state before exiting non-zero, and the
+      # throttle for the "API is broken" alert lives in that state.
       - name: Save state
+        if: always()
         run: bash scripts/save_state.sh

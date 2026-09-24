@@ -34,6 +34,7 @@ class State:
         self.path = path
         self.fresh = not os.path.exists(path)  # first run (or lost cache): seed silently
         self.seen: dict[str, float] = {}
+        self.meta: dict[str, float] = {}
         self.titles: list[tuple[float, frozenset[str]]] = []
         # Titles of items queued this run but not yet finished (classifier may still fail).
         # Never persisted: if we saved them, a retried item would match itself and be dropped.
@@ -43,6 +44,7 @@ class State:
                 with open(path) as f:
                     data = json.load(f)
                 self.seen = data.get("seen", {})
+                self.meta = data.get("meta", {})
                 self.titles = [(t, frozenset(toks.split())) for t, toks in data.get("titles", [])]
             except (OSError, ValueError):
                 self.fresh = True  # corrupt file: treat like a first run rather than crash-looping
@@ -76,6 +78,7 @@ class State:
         self.titles = [(t, toks) for t, toks in self.titles if now - t < TITLE_TTL][-MAX_TITLES:]
         payload = {
             "seen": self.seen,
+            "meta": self.meta,
             "titles": [[t, " ".join(sorted(toks))] for t, toks in self.titles],
         }
         os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)

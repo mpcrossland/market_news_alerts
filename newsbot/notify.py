@@ -24,21 +24,37 @@ TAGS = {
     "trump_post": "mega",
     "other": "newspaper",
 }
-ARROW = {"up": "📈", "down": "📉", "mixed": "↕️", "unclear": ""}
+NO_HISTORY = "No historical data for this type of news."
 # ntfy priorities: 1 min, 2 low, 3 default, 4 high, 5 max/urgent
 PRIORITY = {5: 5, 4: 4, 3: 3}
 
 
-def send(item: Item, v: Verdict, topic: str, server: str = "https://ntfy.sh", token: str | None = None) -> None:
+def build_message(item: Item, history_text: str | None, context_text: str | None) -> str:
+    """What the market was doing (facts), then what happened after past events like this (facts)."""
+    parts = [context_text, history_text or NO_HISTORY]
+    return "\n\n".join(p for p in parts if p) + f"\n— {item.source.name}"
+
+
+def send(item: Item, v: Verdict, message: str, topic: str, server: str = "https://ntfy.sh",
+         token: str | None = None) -> None:
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     body = {
         "topic": topic,
-        "title": f"{ARROW.get(v.direction, '')} {item.source.name}: {item.title}".strip()[:250],
-        "message": v.summary,
+        "title": (v.headline or item.title)[:250],
+        "message": message,
         "priority": PRIORITY.get(v.importance, 3),
         "tags": [TAGS.get(v.category, "newspaper")],
     }
     if item.url:
         body["click"] = item.url
+    r = requests.post(server.rstrip("/") + "/", json=body, headers=headers, timeout=15)
+    r.raise_for_status()
+
+
+def send_status(title: str, message: str, topic: str, server: str = "https://ntfy.sh",
+                token: str | None = None) -> None:
+    """A bot-health message (not news). High priority so it isn't missed."""
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    body = {"topic": topic, "title": title, "message": message, "priority": 4, "tags": ["warning"]}
     r = requests.post(server.rstrip("/") + "/", json=body, headers=headers, timeout=15)
     r.raise_for_status()

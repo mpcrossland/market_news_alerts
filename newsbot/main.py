@@ -3,15 +3,19 @@ import argparse
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 from . import classify as clf
-from . import notify
+from . import history, notify, pricecheck
 from .fetch import Item, enrich, fetch_all
 from .sources import BROAD_KEYWORDS
 from .state import State
 
 log = logging.getLogger("newsbot")
+
+FATAL_REPEAT_S = 6 * 3600  # while the API is broken, push + fail the run at most this often
+EXIT_API_REFUSED = 3
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -81,11 +85,15 @@ def run(dry_run: bool = False) -> int:
         enrich(it)
 
     alerts: list[tuple[Item, clf.Verdict]] = []
+    fatal: str | None = None
     if candidates:
         import anthropic
 
         client = anthropic.Anthropic(api_key=api_key)
-        for it, verdict in clf.classify(client, candidates, model):
+        results, fatal = clf.classify(client, candidates, model)
+        if not fatal:
+            state.meta.pop("fatal_alert", None)  # healthy again: the next outage should alert immediately
+        for it, verdict in results:
             if verdict is None:
                 continue  # left unseen; retried next run (bounded by MAX_AGE_HOURS)
             log.info("[%d] %s: %s", verdict.importance, it.source.name, it.title[:100])
@@ -95,23 +103,46 @@ def run(dry_run: bool = False) -> int:
                 state.mark(it.uid, it.title)
 
     alerts.sort(key=lambda a: -a[1].importance)
-    for n, (it, v) in enumerate(alerts):
-        if n >= max_notifs:
-            log.warning("over cap: dropping alert %r", it.title[:80])
-            state.mark(it.uid, it.title)
-            continue
+    sendable = alerts[:max_notifs]
+    for it, _ in alerts[max_notifs:]:
+        log.warning("over cap: dropping alert %r", it.title[:80])
+        state.mark(it.uid, it.title)
+
+    # One price download covers every alert this run; failures just mean no market-context line.
+    syms = {s for _, v in sendable for s in pricecheck.symbols_for(v.event_type, v.ticker).values()}
+    book = pricecheck.fetch_bars(syms)
+    hist_data = history.load()
+
+    for it, v in sendable:
+        message = notify.build_message(
+            it,
+            history.describe(v.event_type, v.ticker or None, hist_data),
+            pricecheck.context(book, pricecheck.symbols_for(v.event_type, v.ticker), it.published),
+        )
         if dry_run:
-            print(f"\n[{v.importance}/{v.category}/{v.direction}] {it.source.name}: {it.title}\n  -> {v.summary}")
+            print(f"\n[{v.importance}/{v.category}/{v.event_type}] {it.source.name}: {it.title}\n{v.headline}\n{message}")
             continue
         try:
-            notify.send(it, v, topic, server, token)
+            notify.send(it, v, message, topic, server, token)
             state.mark(it.uid, it.title)
         except Exception as e:
             log.error("ntfy send failed (will retry next run): %s", e)
 
+    exit_code = 0
+    if fatal:
+        log.error("classifier unusable: %s", fatal)
+        if not dry_run and time.time() - state.meta.get("fatal_alert", 0) > FATAL_REPEAT_S:
+            state.meta["fatal_alert"] = time.time()
+            exit_code = EXIT_API_REFUSED  # red run in GitHub; quiet (exit 0) for repeats inside the window
+            try:
+                notify.send_status("⚠️ Market bot can't reach Claude",
+                                   f"{fatal}. No alerts until this is fixed.", topic, server, token)
+            except Exception as e:
+                log.error("could not send status push: %s", e)
+
     if not dry_run:
         state.save()
-    return 0
+    return exit_code
 
 
 def main() -> None:
